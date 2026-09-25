@@ -53,6 +53,8 @@ public class MainActivity extends Activity implements RecognitionListener {
     // end-pointer extras and otherwise keep a partial result alive too long.
     private static final long SILENCE_COMMIT_MS = 1450L;
     private static final long MAX_UTTERANCE_MS = 12000L;
+    private static final long RESULT_WATCHDOG_MS = 3500L;
+    private static final int RECYCLE_AFTER_CYCLES = 12;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Translator> translators = new HashMap<>();
@@ -66,6 +68,7 @@ public class MainActivity extends Activity implements RecognitionListener {
     private boolean destroyed = false;
     private boolean preparingTranslation = false;
     private boolean speechStarted = false;
+    private int completedRecognitionCycles = 0;
 
     private TextView status;
     private TextView partial;
@@ -103,6 +106,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         try {
             setStatus("กำลังปิดประโยคและแปล...");
             recognizer.stopListening();
+            armResultWatchdog();
         } catch (Exception ignored) {
         }
     };
@@ -111,8 +115,16 @@ public class MainActivity extends Activity implements RecognitionListener {
         if (!isUsable() || !running || paused || !recognitionActive) return;
         try {
             recognizer.stopListening();
+            armResultWatchdog();
         } catch (Exception ignored) {
+            recycleRecognizerAndRestart(650L);
         }
+    };
+
+    private final Runnable resultWatchdogRunnable = () -> {
+        if (!isUsable() || !running || paused || !recognitionActive) return;
+        setStatus("ไมค์ไม่ส่งผลลัพธ์ • กำลังรีเซ็ตอัตโนมัติ...");
+        recycleRecognizerAndRestart(650L);
     };
 
     @Override
@@ -240,7 +252,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         TextView hint = new TextView(this);
         hint.setText(
                 "เปิดครั้งเดียวแล้วสนทนาได้ต่อเนื่อง • เว้นเงียบสั้น ๆ หลังแต่ละประโยค\n" +
-                "ระบบจะปิดประโยค แปล และกลับมาฟังต่ออัตโนมัติ"
+                "ระบบจะแปลและกลับมาฟังต่ออัตโนมัติ • ถ้าไมค์ค้างจะรีเซ็ตตัวเอง"
         );
         hint.setTextSize(12);
         hint.setTextColor(Color.GRAY);
@@ -351,6 +363,7 @@ public class MainActivity extends Activity implements RecognitionListener {
 
                     recognitionActive = false;
                     speechStarted = false;
+                    completedRecognitionCycles = 0;
                     setStatus("กำลังเปลี่ยนภาษา...");
 
                     prepareRequiredModels(
@@ -811,6 +824,49 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void clearSpeechTimers() {
         handler.removeCallbacks(silenceCommitRunnable);
         handler.removeCallbacks(maxUtteranceRunnable);
+        handler.removeCallbacks(resultWatchdogRunnable);
+    }
+
+    private void armResultWatchdog() {
+        handler.removeCallbacks(resultWatchdogRunnable);
+        if (running && !paused && recognitionActive) {
+            handler.postDelayed(resultWatchdogRunnable, RESULT_WATCHDOG_MS);
+        }
+    }
+
+    private void clearResultWatchdog() {
+        handler.removeCallbacks(resultWatchdogRunnable);
+    }
+
+    private void recycleRecognizerAndRestart(long delayMs) {
+        handler.removeCallbacks(restartRunnable);
+        handler.removeCallbacks(silenceCommitRunnable);
+        handler.removeCallbacks(maxUtteranceRunnable);
+        handler.removeCallbacks(resultWatchdogRunnable);
+
+        recognitionActive = false;
+        speechStarted = false;
+
+        if (recognizer != null) {
+            try {
+                recognizer.cancel();
+            } catch (Exception ignored) {
+            }
+            try {
+                recognizer.destroy();
+            } catch (Exception ignored) {
+            }
+            recognizer = null;
+        }
+
+        if (!isUsable() || !running || paused) return;
+
+        handler.postDelayed(() -> {
+            if (!isUsable() || !running || paused) return;
+            ensureRecognizer();
+            setStatus("🟢 กลับมาฟังต่อแล้ว");
+            scheduleStart(delayMs);
+        }, 250L);
     }
 
     private void togglePause() {
@@ -845,6 +901,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         paused = false;
         recognitionActive = false;
         speechStarted = false;
+        completedRecognitionCycles = 0;
 
         handler.removeCallbacks(restartRunnable);
         clearSpeechTimers();
@@ -885,8 +942,10 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     @Override
     public void onEndOfSpeech() {
-        clearSpeechTimers();
+        handler.removeCallbacks(silenceCommitRunnable);
+        handler.removeCallbacks(maxUtteranceRunnable);
         setStatus("กำลังปิดประโยคและแปล...");
+        armResultWatchdog();
     }
 
     @Override
@@ -904,6 +963,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         recognitionActive = false;
         speechStarted = false;
         clearSpeechTimers();
+        clearResultWatchdog();
 
         if (!isUsable() || !running || paused) return;
 
@@ -915,8 +975,8 @@ public class MainActivity extends Activity implements RecognitionListener {
         }
 
         if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
-            setStatus("ไมค์กำลังเตรียมรอบใหม่...");
-            scheduleStart(1100L);
+            setStatus("ไมค์ค้าง • กำลังรีเซ็ต...");
+            recycleRecognizerAndRestart(700L);
             return;
         }
 
@@ -943,6 +1003,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         recognitionActive = false;
         speechStarted = false;
         clearSpeechTimers();
+        clearResultWatchdog();
 
         if (!isUsable()) return;
 
@@ -954,8 +1015,15 @@ public class MainActivity extends Activity implements RecognitionListener {
         }
 
         if (running && !paused) {
-            setStatus("🟢 กำลังฟังต่อ...");
-            scheduleStart(RESTART_AFTER_RESULT_MS);
+            completedRecognitionCycles++;
+            if (completedRecognitionCycles >= RECYCLE_AFTER_CYCLES) {
+                completedRecognitionCycles = 0;
+                setStatus("กำลังรีเฟรชไมค์เพื่อฟังต่อ...");
+                recycleRecognizerAndRestart(420L);
+            } else {
+                setStatus("🟢 กำลังฟังต่อ...");
+                scheduleStart(RESTART_AFTER_RESULT_MS);
+            }
         }
     }
 
