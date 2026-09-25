@@ -51,6 +51,7 @@ public class MainActivity extends Activity implements RecognitionListener {
     private boolean running = false;
     private boolean paused = false;
     private String detectedLanguage = null;
+    private boolean speechModelsRequested = false;
 
     private TextView status;
     private TextView partial;
@@ -144,7 +145,7 @@ public class MainActivity extends Activity implements RecognitionListener {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         TextView hint = new TextView(this);
-        hint.setText("กดเริ่มครั้งเดียว แล้วพูดภาษาไทย จีน หรืออังกฤษได้เลย\nครั้งแรกอาจใช้เวลาสักครู่เพื่อดาวน์โหลดโมเดลแปลภาษา");
+        hint.setText("กดเริ่มครั้งเดียว ระบบจะฟังไทย จีน และอังกฤษอัตโนมัติ\nเมื่อได้ยินภาษาใด ระบบจะแปลเป็นอีก 2 ภาษาให้ทันที");
         hint.setTextSize(13);
         hint.setTextColor(Color.GRAY);
         hint.setPadding(dp(4), dp(8), dp(4), dp(14));
@@ -231,6 +232,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         if (recognizer == null) {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
             recognizer.setRecognitionListener(this);
+            requestSpeechModels();
         }
     }
 
@@ -249,12 +251,18 @@ public class MainActivity extends Activity implements RecognitionListener {
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
 
         if (Build.VERSION.SDK_INT >= 34) {
+            // Start with Thai as the base model, then switch immediately when
+            // Chinese or English speech is detected.
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "th-TH");
             i.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true);
             i.putStringArrayListExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
                     new ArrayList<>(Arrays.asList("th-TH", "zh-CN", "en-US"))
             );
-            i.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH, true);
+            i.putExtra(
+                    RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH,
+                    RecognizerIntent.LANGUAGE_SWITCH_QUICK_RESPONSE
+            );
             i.putStringArrayListExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_SWITCH_ALLOWED_LANGUAGES,
                     new ArrayList<>(Arrays.asList("th-TH", "zh-CN", "en-US"))
@@ -266,6 +274,27 @@ public class MainActivity extends Activity implements RecognitionListener {
         } catch (Exception e) {
             setStatus("เริ่มฟังไม่สำเร็จ: " + safe(e));
             scheduleRestart(1200);
+        }
+    }
+
+    private void requestSpeechModels() {
+        if (speechModelsRequested || recognizer == null || Build.VERSION.SDK_INT < 33) return;
+        speechModelsRequested = true;
+
+        String[] locales = {"th-TH", "zh-CN", "en-US"};
+        for (String locale : locales) {
+            Intent modelIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            modelIntent.putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+            );
+            modelIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale);
+            try {
+                recognizer.triggerModelDownload(modelIntent);
+            } catch (Exception ignored) {
+                // Some recognition services do not expose downloadable models.
+                // Online recognition and language switching can still work.
+            }
         }
     }
 
