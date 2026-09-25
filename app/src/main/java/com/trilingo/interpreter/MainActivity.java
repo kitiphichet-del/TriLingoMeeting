@@ -59,6 +59,8 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Translator> translators = new HashMap<>();
+    private final Map<String, Boolean> translatorReady = new HashMap<>();
+    private boolean preparingTranslation = false;
     private final SimpleDateFormat clock = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
 
     private SpeechRecognizer recognizer;
@@ -687,7 +689,7 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void refreshButtons() {
         if (!isUsable()) return;
 
-        start.setEnabled(!running);
+        start.setEnabled(!running && !preparingTranslation);
         pause.setEnabled(running);
         stop.setEnabled(running);
         pause.setText(paused ? "▶ ทำต่อ" : "⏸ พัก");
@@ -731,19 +733,106 @@ public class MainActivity extends Activity implements RecognitionListener {
             return;
         }
 
-        running = true;
-        paused = false;
-        changingContext = false;
-        recognitionActive = false;
+        if (preparingTranslation) return;
 
-        // Keep settings collapsed when meeting starts.
-        settingsExpanded = false;
-        settingsPanel.setVisibility(View.GONE);
-        settingsToggle.setText("⚙ การตั้งค่า ▾");
-
-        ensureRecognizer();
+        preparingTranslation = true;
+        setStatus("กำลังเตรียมโมเดลแปลภาษา...");
         refreshButtons();
-        scheduleStart(300L);
+
+        prepareSelectedTranslationModels(() -> {
+            if (!isUsable()) return;
+
+            preparingTranslation = false;
+            running = true;
+            paused = false;
+            changingContext = false;
+            recognitionActive = false;
+
+            settingsExpanded = false;
+            settingsPanel.setVisibility(View.GONE);
+            settingsToggle.setText("⚙ การตั้งค่า ▾");
+
+            ensureRecognizer();
+            refreshButtons();
+            setStatus("พร้อมฟัง");
+            scheduleStart(300L);
+        }, () -> {
+            if (!isUsable()) return;
+
+            preparingTranslation = false;
+            running = false;
+            setStatus("เตรียมโมเดลแปลไม่สำเร็จ • ตรวจอินเทอร์เน็ตแล้วกดเริ่มอีกครั้ง");
+            refreshButtons();
+        });
+    }
+
+    private void prepareSelectedTranslationModels(
+            Runnable onReady,
+            Runnable onFailure
+    ) {
+        ArrayList<String> langs = new ArrayList<>();
+        if (thaiCheck.isChecked()) langs.add("th");
+        if (chineseCheck.isChecked()) langs.add("zh");
+        if (englishCheck.isChecked()) langs.add("en");
+
+        ArrayList<String[]> pairs = new ArrayList<>();
+        for (String source : langs) {
+            for (String target : langs) {
+                if (!source.equals(target)) {
+                    pairs.add(new String[]{source, target});
+                }
+            }
+        }
+
+        if (pairs.isEmpty()) {
+            onReady.run();
+            return;
+        }
+
+        final int total = pairs.size();
+        final int[] finished = {0};
+        final boolean[] failed = {false};
+        DownloadConditions conditions = new DownloadConditions.Builder().build();
+
+        for (String[] pair : pairs) {
+            String source = pair[0];
+            String target = pair[1];
+            String key = source + ">" + target;
+
+            if (Boolean.TRUE.equals(translatorReady.get(key))) {
+                finished[0]++;
+                if (finished[0] == total) {
+                    if (failed[0]) onFailure.run();
+                    else onReady.run();
+                }
+                continue;
+            }
+
+            Translator t = translator(source, target);
+            t.downloadModelIfNeeded(conditions)
+                    .addOnSuccessListener(v -> {
+                        translatorReady.put(key, true);
+                        finished[0]++;
+                        if (isUsable()) {
+                            setStatus(
+                                    "กำลังเตรียมโมเดลแปลภาษา... " +
+                                    finished[0] + "/" + total
+                            );
+                        }
+                        if (finished[0] == total) {
+                            if (failed[0]) onFailure.run();
+                            else onReady.run();
+                        }
+                    })
+                    .addOnFailureListener(e -> {
+                        translatorReady.put(key, false);
+                        failed[0] = true;
+                        finished[0]++;
+                        if (finished[0] == total) {
+                            onFailure.run();
+                        }
+                    });
+        }
     }
 
     private void ensureRecognizer() {
@@ -1199,30 +1288,94 @@ public class MainActivity extends Activity implements RecognitionListener {
             return;
         }
 
-        Translator translator = translator(source, target);
-        DownloadConditions conditions =
-                new DownloadConditions.Builder().build();
+        translateDirect(text, source, target, value -> {
+            if (!"[TIMEOUT]".equals(value) &&
+                    !"[FAILED]".equals(value)) {
+                cb.onDone(value);
+                return;
+            }
 
-        translator.downloadModelIfNeeded(conditions)
-                .addOnSuccessListener(v -> {
-                    if (destroyed) return;
+            // Explicit English bridge for Thai <-> Chinese if the direct
+            // on-device request stalls on a particular ML Kit/device build.
+            boolean thaiChinese =
+                    ("th".equals(source) && "zh".equals(target)) ||
+                    ("zh".equals(source) && "th".equals(target));
 
-                    translator.translate(text)
-                            .addOnSuccessListener(value -> {
-                                if (!destroyed) {
-                                    cb.onDone(value);
-                                }
-                            })
-                            .addOnFailureListener(e -> {
-                                if (!destroyed) {
-                                    cb.onDone("[แปลไม่สำเร็จ]");
-                                }
-                            });
+            if (thaiChinese) {
+                translateDirect(text, source, "en", english -> {
+                    if ("[TIMEOUT]".equals(english) ||
+                            "[FAILED]".equals(english)) {
+                        cb.onDone("[แปลไม่สำเร็จ]");
+                        return;
+                    }
+
+                    translateDirect(english, "en", target, bridged -> {
+                        if ("[TIMEOUT]".equals(bridged) ||
+                                "[FAILED]".equals(bridged)) {
+                            cb.onDone("[แปลไม่สำเร็จ]");
+                        } else {
+                            cb.onDone(bridged);
+                        }
+                    });
+                });
+            } else {
+                cb.onDone("[แปลไม่สำเร็จ]");
+            }
+        });
+    }
+
+    private void translateDirect(
+            String text,
+            String source,
+            String target,
+            TextCallback cb
+    ) {
+        String key = source + ">" + target;
+        Translator t = translator(source, target);
+        DownloadConditions conditions = new DownloadConditions.Builder().build();
+
+        final boolean[] completed = {false};
+
+        Runnable timeout = () -> {
+            if (!completed[0] && !destroyed) {
+                completed[0] = true;
+                cb.onDone("[TIMEOUT]");
+            }
+        };
+        handler.postDelayed(timeout, 12000L);
+
+        Runnable doTranslate = () -> t.translate(text)
+                .addOnSuccessListener(value -> {
+                    if (completed[0] || destroyed) return;
+                    completed[0] = true;
+                    handler.removeCallbacks(timeout);
+                    cb.onDone(value);
                 })
                 .addOnFailureListener(e -> {
-                    if (!destroyed) {
-                        cb.onDone("[ดาวน์โหลดโมเดลไม่สำเร็จ]");
+                    if (completed[0] || destroyed) return;
+                    completed[0] = true;
+                    handler.removeCallbacks(timeout);
+                    cb.onDone("[FAILED]");
+                });
+
+        if (Boolean.TRUE.equals(translatorReady.get(key))) {
+            doTranslate.run();
+            return;
+        }
+
+        t.downloadModelIfNeeded(conditions)
+                .addOnSuccessListener(v -> {
+                    translatorReady.put(key, true);
+                    if (!completed[0] && !destroyed) {
+                        doTranslate.run();
                     }
+                })
+                .addOnFailureListener(e -> {
+                    translatorReady.put(key, false);
+                    if (completed[0] || destroyed) return;
+                    completed[0] = true;
+                    handler.removeCallbacks(timeout);
+                    cb.onDone("[FAILED]");
                 });
     }
 
@@ -1498,6 +1651,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         }
 
         translators.clear();
+        translatorReady.clear();
         super.onDestroy();
     }
 }
