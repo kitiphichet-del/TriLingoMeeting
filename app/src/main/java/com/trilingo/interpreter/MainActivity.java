@@ -770,19 +770,8 @@ public class MainActivity extends Activity implements RecognitionListener {
             Runnable onReady,
             Runnable onFailure
     ) {
-        ArrayList<String> langs = new ArrayList<>();
-        if (thaiCheck.isChecked()) langs.add("th");
-        if (chineseCheck.isChecked()) langs.add("zh");
-        if (englishCheck.isChecked()) langs.add("en");
-
-        ArrayList<String[]> pairs = new ArrayList<>();
-        for (String source : langs) {
-            for (String target : langs) {
-                if (!source.equals(target)) {
-                    pairs.add(new String[]{source, target});
-                }
-            }
-        }
+        String source = currentInputLanguage();
+        ArrayList<String[]> pairs = requiredTranslationPairs(source);
 
         if (pairs.isEmpty()) {
             onReady.run();
@@ -795,9 +784,9 @@ public class MainActivity extends Activity implements RecognitionListener {
         DownloadConditions conditions = new DownloadConditions.Builder().build();
 
         for (String[] pair : pairs) {
-            String source = pair[0];
-            String target = pair[1];
-            String key = source + ">" + target;
+            String from = pair[0];
+            String to = pair[1];
+            String key = from + ">" + to;
 
             if (Boolean.TRUE.equals(translatorReady.get(key))) {
                 finished[0]++;
@@ -808,17 +797,19 @@ public class MainActivity extends Activity implements RecognitionListener {
                 continue;
             }
 
-            Translator t = translator(source, target);
+            Translator t = translator(from, to);
             t.downloadModelIfNeeded(conditions)
                     .addOnSuccessListener(v -> {
                         translatorReady.put(key, true);
                         finished[0]++;
+
                         if (isUsable()) {
                             setStatus(
                                     "กำลังเตรียมโมเดลแปลภาษา... " +
                                     finished[0] + "/" + total
                             );
                         }
+
                         if (finished[0] == total) {
                             if (failed[0]) onFailure.run();
                             else onReady.run();
@@ -828,11 +819,54 @@ public class MainActivity extends Activity implements RecognitionListener {
                         translatorReady.put(key, false);
                         failed[0] = true;
                         finished[0]++;
+
                         if (finished[0] == total) {
                             onFailure.run();
                         }
                     });
         }
+    }
+
+    private ArrayList<String[]> requiredTranslationPairs(String source) {
+        ArrayList<String[]> pairs = new ArrayList<>();
+
+        if ("zh".equals(source)) {
+            if (englishCheck.isChecked() || thaiCheck.isChecked()) {
+                addPairIfMissing(pairs, "zh", "en");
+            }
+            if (thaiCheck.isChecked()) {
+                addPairIfMissing(pairs, "en", "th");
+            }
+        } else if ("th".equals(source)) {
+            if (englishCheck.isChecked() || chineseCheck.isChecked()) {
+                addPairIfMissing(pairs, "th", "en");
+            }
+            if (chineseCheck.isChecked()) {
+                addPairIfMissing(pairs, "en", "zh");
+            }
+        } else {
+            if (thaiCheck.isChecked()) {
+                addPairIfMissing(pairs, "en", "th");
+            }
+            if (chineseCheck.isChecked()) {
+                addPairIfMissing(pairs, "en", "zh");
+            }
+        }
+
+        return pairs;
+    }
+
+    private void addPairIfMissing(
+            ArrayList<String[]> pairs,
+            String source,
+            String target
+    ) {
+        for (String[] pair : pairs) {
+            if (source.equals(pair[0]) && target.equals(pair[1])) {
+                return;
+            }
+        }
+        pairs.add(new String[]{source, target});
     }
 
     private void ensureRecognizer() {
@@ -931,6 +965,12 @@ public class MainActivity extends Activity implements RecognitionListener {
         changingContext = true;
         handler.removeCallbacks(restartRunnable);
         setStatus(message);
+
+        // Keep only lightweight state when the meeting context changes.
+        // Translator clients will be recreated lazily for the new source.
+        if (message.contains("ภาษา")) {
+            closeTranslationClients();
+        }
 
         if (recognitionActive) {
             try {
@@ -1288,38 +1328,39 @@ public class MainActivity extends Activity implements RecognitionListener {
             return;
         }
 
-        translateDirect(text, source, target, value -> {
-            if (!"[TIMEOUT]".equals(value) &&
-                    !"[FAILED]".equals(value)) {
-                cb.onDone(value);
-                return;
-            }
+        // v1.4 deliberately avoids direct Thai <-> Chinese translators.
+        // Use English as a stable bridge, which also keeps the number of
+        // active Translator instances small on memory-sensitive devices.
+        boolean thaiChinese =
+                ("th".equals(source) && "zh".equals(target)) ||
+                ("zh".equals(source) && "th".equals(target));
 
-            // Explicit English bridge for Thai <-> Chinese if the direct
-            // on-device request stalls on a particular ML Kit/device build.
-            boolean thaiChinese =
-                    ("th".equals(source) && "zh".equals(target)) ||
-                    ("zh".equals(source) && "th".equals(target));
+        if (thaiChinese) {
+            translateDirect(text, source, "en", english -> {
+                if ("[TIMEOUT]".equals(english) ||
+                        "[FAILED]".equals(english)) {
+                    cb.onDone("[แปลไม่สำเร็จ]");
+                    return;
+                }
 
-            if (thaiChinese) {
-                translateDirect(text, source, "en", english -> {
-                    if ("[TIMEOUT]".equals(english) ||
-                            "[FAILED]".equals(english)) {
+                translateDirect(english, "en", target, bridged -> {
+                    if ("[TIMEOUT]".equals(bridged) ||
+                            "[FAILED]".equals(bridged)) {
                         cb.onDone("[แปลไม่สำเร็จ]");
-                        return;
+                    } else {
+                        cb.onDone(bridged);
                     }
-
-                    translateDirect(english, "en", target, bridged -> {
-                        if ("[TIMEOUT]".equals(bridged) ||
-                                "[FAILED]".equals(bridged)) {
-                            cb.onDone("[แปลไม่สำเร็จ]");
-                        } else {
-                            cb.onDone(bridged);
-                        }
-                    });
                 });
-            } else {
+            });
+            return;
+        }
+
+        translateDirect(text, source, target, value -> {
+            if ("[TIMEOUT]".equals(value) ||
+                    "[FAILED]".equals(value)) {
                 cb.onDone("[แปลไม่สำเร็จ]");
+            } else {
+                cb.onDone(value);
             }
         });
     }
@@ -1342,7 +1383,7 @@ public class MainActivity extends Activity implements RecognitionListener {
                 cb.onDone("[TIMEOUT]");
             }
         };
-        handler.postDelayed(timeout, 12000L);
+        handler.postDelayed(timeout, 9000L);
 
         Runnable doTranslate = () -> t.translate(text)
                 .addOnSuccessListener(value -> {
@@ -1560,6 +1601,17 @@ public class MainActivity extends Activity implements RecognitionListener {
         }
     }
 
+    private void closeTranslationClients() {
+        for (Translator t : translators.values()) {
+            try {
+                t.close();
+            } catch (Exception ignored) {
+            }
+        }
+        translators.clear();
+        translatorReady.clear();
+    }
+
     @Override
     protected void onStop() {
         super.onStop();
@@ -1643,15 +1695,7 @@ public class MainActivity extends Activity implements RecognitionListener {
             recognizer = null;
         }
 
-        for (Translator t : translators.values()) {
-            try {
-                t.close();
-            } catch (Exception ignored) {
-            }
-        }
-
-        translators.clear();
-        translatorReady.clear();
+        closeTranslationClients();
         super.onDestroy();
     }
 }
