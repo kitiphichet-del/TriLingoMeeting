@@ -102,7 +102,14 @@ public class MainActivity extends Activity implements RecognitionListener {
         beginRecognition();
     };
 
-    private final Runnable silenceCommitRunnable = () -> {
+    private final Runnable silenceCommitRunnable = new Runnable() {
+        @Override
+        public void run() {
+            checkSilenceAndCommit();
+        }
+    };
+
+    private void checkSilenceAndCommit() {
         if (!isUsable() || !running || paused || !recognitionActive || !speechStarted) return;
 
         long quietFor = System.currentTimeMillis() - lastVoiceActivityAt;
@@ -121,7 +128,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         } catch (Exception ignored) {
             recycleRecognizerAndRestart(650L);
         }
-    };
+    }
 
     private final Runnable maxUtteranceRunnable = () -> {
         if (!isUsable() || !running || paused || !recognitionActive) return;
@@ -292,7 +299,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(controls, controlParams);
 
         TextView version = new TextView(this);
-        version.setText("TriLingo Meeting v" + BuildConfig.VERSION_NAME);
+        version.setText("TriLingo Meeting v" + appVersionName());
         version.setTextSize(10);
         version.setTextColor(Color.rgb(145, 150, 160));
         version.setGravity(Gravity.CENTER);
@@ -412,6 +419,17 @@ public class MainActivity extends Activity implements RecognitionListener {
         settingsExpanded = !settingsExpanded;
         settingsPanel.setVisibility(settingsExpanded ? View.VISIBLE : View.GONE);
         settingsToggle.setText(settingsExpanded ? "⚙ การตั้งค่า ▴" : "⚙ การตั้งค่า ▾");
+    }
+
+    private String appVersionName() {
+        try {
+            String value = getPackageManager()
+                    .getPackageInfo(getPackageName(), 0)
+                    .versionName;
+            return value == null ? "1.9.0" : value;
+        } catch (Exception ignored) {
+            return "1.9.0";
+        }
     }
 
     private TextView smallTitle(String text) {
