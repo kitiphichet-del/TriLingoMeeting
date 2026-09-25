@@ -51,9 +51,9 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     // Our own silence watchdog. Some Android speech providers ignore the
     // end-pointer extras and otherwise keep a partial result alive too long.
-    private static final long SILENCE_COMMIT_MS = 1450L;
-    private static final long MAX_UTTERANCE_MS = 12000L;
-    private static final long RESULT_WATCHDOG_MS = 3500L;
+    private static final long SILENCE_COMMIT_MS = 2600L;
+    private static final long MAX_UTTERANCE_MS = 45000L;
+    private static final long RESULT_WATCHDOG_MS = 8000L;
     private static final int RECYCLE_AFTER_CYCLES = 12;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -68,6 +68,7 @@ public class MainActivity extends Activity implements RecognitionListener {
     private boolean destroyed = false;
     private boolean preparingTranslation = false;
     private boolean speechStarted = false;
+    private long lastVoiceActivityAt = 0L;
     private int completedRecognitionCycles = 0;
 
     private TextView status;
@@ -103,11 +104,22 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     private final Runnable silenceCommitRunnable = () -> {
         if (!isUsable() || !running || paused || !recognitionActive || !speechStarted) return;
+
+        long quietFor = System.currentTimeMillis() - lastVoiceActivityAt;
+        if (quietFor < SILENCE_COMMIT_MS) {
+            handler.postDelayed(
+                    silenceCommitRunnable,
+                    Math.max(250L, SILENCE_COMMIT_MS - quietFor)
+            );
+            return;
+        }
+
         try {
             setStatus("กำลังปิดประโยคและแปล...");
             recognizer.stopListening();
             armResultWatchdog();
         } catch (Exception ignored) {
+            recycleRecognizerAndRestart(650L);
         }
     };
 
@@ -251,8 +263,8 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         TextView hint = new TextView(this);
         hint.setText(
-                "เปิดครั้งเดียวแล้วสนทนาได้ต่อเนื่อง • เว้นเงียบสั้น ๆ หลังแต่ละประโยค\n" +
-                "ระบบจะแปลและกลับมาฟังต่ออัตโนมัติ • ถ้าไมค์ค้างจะรีเซ็ตตัวเอง"
+                "รองรับประโยคยาวขึ้น • พูดต่อเนื่องได้ประมาณ 45 วินาทีต่อช่วง\n" +
+                "เว้นเงียบประมาณ 2–3 วินาทีเพื่อจบประโยค แล้วระบบจะฟังต่อเอง"
         );
         hint.setTextSize(12);
         hint.setTextColor(Color.GRAY);
@@ -278,6 +290,14 @@ public class MainActivity extends Activity implements RecognitionListener {
         LinearLayout.LayoutParams controlParams = full();
         controlParams.setMargins(0, dp(4), 0, dp(4));
         root.addView(controls, controlParams);
+
+        TextView version = new TextView(this);
+        version.setText("TriLingo Meeting v" + BuildConfig.VERSION_NAME);
+        version.setTextSize(10);
+        version.setTextColor(Color.rgb(145, 150, 160));
+        version.setGravity(Gravity.CENTER);
+        version.setPadding(0, dp(2), 0, dp(2));
+        root.addView(version, full());
 
         setContentView(root);
         root.requestApplyInsets();
@@ -794,6 +814,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         sourceForCurrentRecognition = currentInputLanguage();
         recognitionActive = true;
         speechStarted = false;
+        lastVoiceActivityAt = 0L;
         partial.setText("");
         setStatus("🟢 กำลังฟัง...");
 
@@ -846,6 +867,7 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         recognitionActive = false;
         speechStarted = false;
+        lastVoiceActivityAt = 0L;
 
         if (recognizer != null) {
             try {
@@ -928,12 +950,23 @@ public class MainActivity extends Activity implements RecognitionListener {
     @Override
     public void onBeginningOfSpeech() {
         speechStarted = true;
+        lastVoiceActivityAt = System.currentTimeMillis();
         setStatus("🎙 กำลังพูด...");
-        armSilenceCommit();
+        // Do not start a short countdown here. Some speech providers send
+        // partial results slowly, which used to cut long sentences too early.
     }
 
     @Override
     public void onRmsChanged(float rmsdB) {
+        if (!recognitionActive || !speechStarted) return;
+
+        // Reset the silence timer while voice energy is still present.
+        // The threshold is intentionally low because quiet speakers and
+        // distant meeting-room speech must still keep the utterance alive.
+        if (rmsdB > 1.0f) {
+            lastVoiceActivityAt = System.currentTimeMillis();
+            armSilenceCommit();
+        }
     }
 
     @Override
@@ -1035,6 +1068,7 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         if (text != null && !text.trim().isEmpty()) {
             speechStarted = true;
+            lastVoiceActivityAt = System.currentTimeMillis();
             partial.setText("“" + text + "”");
             armSilenceCommit();
         }
