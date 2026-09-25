@@ -55,7 +55,18 @@ public class MainActivity extends Activity implements RecognitionListener {
     private LanguageIdentifier languageIdentifier;
     private boolean running = false;
     private boolean paused = false;
+    private boolean listening = false;
+    private boolean restartScheduled = false;
+    private int busyErrorCount = 0;
     private String detectedLanguage = null;
+
+    private final Runnable restartRunnable = () -> {
+        restartScheduled = false;
+        if (running && !paused && !isFinishing() &&
+                (Build.VERSION.SDK_INT < 17 || !isDestroyed())) {
+            beginRecognition();
+        }
+    };
 
     private TextView status;
     private TextView partial;
@@ -220,8 +231,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         inputLanguageGroup.setOnCheckedChangeListener((group, checkedId) -> {
             saveInputLanguageMode();
             if (running && !paused) {
-                if (recognizer != null) recognizer.cancel();
-                handler.postDelayed(this::beginRecognition, 180);
+                restartRecognition(900, true);
             }
         });
 
@@ -247,7 +257,7 @@ public class MainActivity extends Activity implements RecognitionListener {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         TextView hint = new TextView(this);
-        hint.setText("พูดจีนแล้วเป็นไทย ให้เลือก 🇨🇳 中文 ที่ ‘ภาษาผู้พูดตอนนี้’\nAuto ใช้ได้เมื่อบริการ Speech ของเครื่องรองรับการสลับภาษา");
+        hint.setText("ระบบรอฟังนานขึ้นก่อนตัดประโยค เพื่อไม่ตัดคำเร็วเกินไป\nถ้า Auto ฟังผิด ให้เลือกภาษาผู้พูด 🇹🇭 / 🇨🇳 / 🇬🇧 ได้ทันที");
         hint.setTextSize(13);
         hint.setTextColor(Color.GRAY);
         hint.setPadding(dp(4), dp(8), dp(4), dp(12));
@@ -473,8 +483,11 @@ public class MainActivity extends Activity implements RecognitionListener {
     }
 
     private void beginRecognition() {
-        if (!running || paused || recognizer == null) return;
+        if (!running || paused || recognizer == null || listening ||
+                isFinishing() || (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
 
+        handler.removeCallbacks(restartRunnable);
+        restartScheduled = false;
         detectedLanguage = null;
         partial.setText("");
         setStatus("🟢 กำลังฟัง...");
@@ -483,8 +496,11 @@ public class MainActivity extends Activity implements RecognitionListener {
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L);
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
+        // Give speakers more time to pause naturally, especially for Chinese
+        // and longer English sentences.
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2600L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L);
 
         String inputMode = currentInputLanguage();
         ArrayList<String> allowed = selectedLocales();
@@ -516,10 +532,12 @@ public class MainActivity extends Activity implements RecognitionListener {
         }
 
         try {
+            listening = true;
             recognizer.startListening(i);
         } catch (Exception e) {
-            setStatus("เริ่มฟังไม่สำเร็จ: " + safe(e));
-            scheduleRestart(1200);
+            listening = false;
+            setStatus("เริ่มฟังไม่สำเร็จ กำลังลองใหม่...");
+            restartRecognition(1400, false);
         }
     }
 
@@ -528,10 +546,15 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         paused = !paused;
         if (paused) {
-            if (recognizer != null) recognizer.cancel();
+            handler.removeCallbacks(restartRunnable);
+            restartScheduled = false;
+            listening = false;
+            if (recognizer != null) {
+                try { recognizer.cancel(); } catch (Exception ignored) {}
+            }
             setStatus("⏸ พักการฟัง");
         } else {
-            beginRecognition();
+            restartRecognition(500, false);
         }
         refreshButtons();
     }
@@ -539,32 +562,89 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void stopSession() {
         running = false;
         paused = false;
-        if (recognizer != null) recognizer.cancel();
+        listening = false;
+        handler.removeCallbacks(restartRunnable);
+        restartScheduled = false;
+        if (recognizer != null) {
+            try { recognizer.cancel(); } catch (Exception ignored) {}
+        }
         partial.setText("");
         setStatus("หยุดแล้ว");
         refreshButtons();
     }
 
-    private void scheduleRestart(long delay) {
-        handler.postDelayed(() -> {
-            if (running && !paused) beginRecognition();
-        }, delay);
+    private void restartRecognition(long delay, boolean cancelCurrent) {
+        if (!running || paused) return;
+
+        handler.removeCallbacks(restartRunnable);
+        restartScheduled = true;
+
+        if (cancelCurrent && recognizer != null) {
+            listening = false;
+            try { recognizer.cancel(); } catch (Exception ignored) {}
+        }
+
+        handler.postDelayed(restartRunnable, delay);
     }
 
-    @Override public void onReadyForSpeech(Bundle params) { setStatus("🟢 กำลังฟัง..."); }
+    private void recreateRecognizer() {
+        listening = false;
+        if (recognizer != null) {
+            try { recognizer.cancel(); } catch (Exception ignored) {}
+            try { recognizer.destroy(); } catch (Exception ignored) {}
+        }
+        recognizer = null;
+
+        if (!running || paused || isFinishing() ||
+                (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
+
+        handler.postDelayed(() -> {
+            if (!running || paused || isFinishing() ||
+                    (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
+            ensureRecognizer();
+            restartRecognition(700, false);
+        }, 450);
+    }
+
+    @Override public void onReadyForSpeech(Bundle params) {
+        listening = true;
+        busyErrorCount = 0;
+        setStatus("🟢 กำลังฟัง...");
+    }
     @Override public void onBeginningOfSpeech() { setStatus("🎙 กำลังพูด..."); }
     @Override public void onRmsChanged(float rmsdB) {}
     @Override public void onBufferReceived(byte[] buffer) {}
-    @Override public void onEndOfSpeech() { setStatus("กำลังประมวลผล..."); }
+    @Override public void onEndOfSpeech() {
+        listening = false;
+        setStatus("กำลังประมวลผล...");
+    }
 
     @Override
     public void onError(int error) {
+        listening = false;
         if (!running || paused) return;
-        long delay = (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) ? 1000 : 450;
-        if (error != SpeechRecognizer.ERROR_NO_MATCH && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-            setStatus("กำลังเริ่มฟังใหม่...");
+
+        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+            busyErrorCount++;
+            setStatus("ไมค์กำลังรีเซ็ต...");
+            if (busyErrorCount >= 2) {
+                busyErrorCount = 0;
+                recreateRecognizer();
+            } else {
+                restartRecognition(1600, true);
+            }
+            return;
         }
-        scheduleRestart(delay);
+
+        if (error == SpeechRecognizer.ERROR_NO_MATCH ||
+                error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+            setStatus("🟢 รอฟังประโยคถัดไป...");
+            restartRecognition(900, false);
+            return;
+        }
+
+        setStatus("กำลังเริ่มฟังใหม่...");
+        restartRecognition(1300, true);
     }
 
     @Override
@@ -578,13 +658,14 @@ public class MainActivity extends Activity implements RecognitionListener {
             processUtterance(text.trim(), sourceHint);
         }
 
-        if (running && !paused) scheduleRestart(250);
+        listening = false;
+        if (running && !paused) restartRecognition(850, false);
     }
 
     @Override
     public void onPartialResults(Bundle partialResults) {
         String text = firstText(partialResults);
-        if (text != null) partial.setText("“" + text + "”");
+        if (text != null && !isFinishing()) partial.setText("“" + text + "”");
     }
 
     @Override public void onEvent(int eventType, Bundle params) {}
@@ -834,10 +915,14 @@ public class MainActivity extends Activity implements RecognitionListener {
     @Override
     protected void onDestroy() {
         running = false;
+        paused = true;
+        listening = false;
+        restartScheduled = false;
         handler.removeCallbacksAndMessages(null);
 
         if (recognizer != null) {
-            recognizer.destroy();
+            try { recognizer.cancel(); } catch (Exception ignored) {}
+            try { recognizer.destroy(); } catch (Exception ignored) {}
             recognizer = null;
         }
 
