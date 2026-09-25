@@ -29,8 +29,6 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.google.mlkit.common.model.DownloadConditions;
-import com.google.mlkit.nl.languageid.LanguageIdentification;
-import com.google.mlkit.nl.languageid.LanguageIdentifier;
 import com.google.mlkit.nl.translate.TranslateLanguage;
 import com.google.mlkit.nl.translate.Translation;
 import com.google.mlkit.nl.translate.Translator;
@@ -47,26 +45,20 @@ public class MainActivity extends Activity implements RecognitionListener {
     private static final int REQ_MIC = 1001;
     private static final String PREFS = "trilingo_preferences";
 
+    private static final long RESTART_AFTER_RESULT_MS = 1200L;
+    private static final long RESTART_AFTER_TIMEOUT_MS = 1500L;
+    private static final long RESTART_AFTER_ERROR_MS = 2200L;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Translator> translators = new HashMap<>();
     private final SimpleDateFormat clock = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
 
     private SpeechRecognizer recognizer;
-    private LanguageIdentifier languageIdentifier;
     private boolean running = false;
     private boolean paused = false;
-    private boolean listening = false;
-    private boolean restartScheduled = false;
-    private int busyErrorCount = 0;
-    private String detectedLanguage = null;
-
-    private final Runnable restartRunnable = () -> {
-        restartScheduled = false;
-        if (running && !paused && !isFinishing() &&
-                (Build.VERSION.SDK_INT < 17 || !isDestroyed())) {
-            beginRecognition();
-        }
-    };
+    private boolean recognitionActive = false;
+    private boolean changingLanguage = false;
+    private boolean destroyed = false;
 
     private TextView status;
     private TextView partial;
@@ -80,15 +72,18 @@ public class MainActivity extends Activity implements RecognitionListener {
     private CheckBox chineseCheck;
     private CheckBox englishCheck;
     private RadioGroup inputLanguageGroup;
-    private RadioButton autoInput;
     private RadioButton thaiInput;
     private RadioButton chineseInput;
     private RadioButton englishInput;
 
+    private final Runnable restartRunnable = () -> {
+        if (!isUsable() || !running || paused || recognitionActive) return;
+        beginRecognition();
+    };
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        languageIdentifier = LanguageIdentification.getClient();
         buildUi();
         restoreLanguageSelection();
         restoreInputLanguageMode();
@@ -151,12 +146,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         subtitle.setPadding(0, dp(2), 0, dp(5));
         root.addView(subtitle, full());
 
-        TextView selectorTitle = new TextView(this);
-        selectorTitle.setText("เลือกภาษาที่ใช้ในการสนทนา");
-        selectorTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        selectorTitle.setTextSize(13);
-        selectorTitle.setTextColor(Color.rgb(75, 85, 100));
-        selectorTitle.setPadding(0, dp(4), 0, 0);
+        TextView selectorTitle = smallTitle("เลือกภาษาที่ต้องการแสดงผล");
         root.addView(selectorTitle, full());
 
         LinearLayout languageRow = new LinearLayout(this);
@@ -193,36 +183,28 @@ public class MainActivity extends Activity implements RecognitionListener {
         languageHint.setPadding(dp(2), 0, dp(2), dp(4));
         root.addView(languageHint, full());
 
-        TextView inputTitle = new TextView(this);
-        inputTitle.setText("ภาษาผู้พูดตอนนี้");
-        inputTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        inputTitle.setTextSize(13);
-        inputTitle.setTextColor(Color.rgb(75, 85, 100));
-        inputTitle.setPadding(0, dp(3), 0, dp(1));
+        TextView inputTitle = smallTitle("ภาษาผู้พูดตอนนี้");
         root.addView(inputTitle, full());
 
         inputLanguageGroup = new RadioGroup(this);
         inputLanguageGroup.setOrientation(LinearLayout.HORIZONTAL);
         inputLanguageGroup.setGravity(Gravity.CENTER_VERTICAL);
 
-        autoInput = inputRadio("Auto");
         thaiInput = inputRadio("🇹🇭 ไทย");
         chineseInput = inputRadio("🇨🇳 中文");
         englishInput = inputRadio("🇬🇧 EN");
 
-        autoInput.setId(View.generateViewId());
         thaiInput.setId(View.generateViewId());
         chineseInput.setId(View.generateViewId());
         englishInput.setId(View.generateViewId());
 
-        inputLanguageGroup.addView(autoInput, weighted());
         inputLanguageGroup.addView(thaiInput, weighted());
         inputLanguageGroup.addView(chineseInput, weighted());
         inputLanguageGroup.addView(englishInput, weighted());
         root.addView(inputLanguageGroup, full());
 
         TextView inputHelp = new TextView(this);
-        inputHelp.setText("ถ้า Auto ฟังจีน/อังกฤษผิด ให้แตะภาษาผู้พูดก่อนเริ่มพูด");
+        inputHelp.setText("โหมดเสถียร: เลือกภาษาของคนที่กำลังพูด แล้วระบบจะถอดเสียงและแปลให้");
         inputHelp.setTextSize(11);
         inputHelp.setTextColor(Color.GRAY);
         inputHelp.setPadding(dp(2), 0, dp(2), dp(3));
@@ -231,7 +213,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         inputLanguageGroup.setOnCheckedChangeListener((group, checkedId) -> {
             saveInputLanguageMode();
             if (running && !paused) {
-                restartRecognition(900, true);
+                requestLanguageChange();
             }
         });
 
@@ -252,12 +234,14 @@ public class MainActivity extends Activity implements RecognitionListener {
         timeline = new LinearLayout(this);
         timeline.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(timeline, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
         root.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         TextView hint = new TextView(this);
-        hint.setText("ระบบรอฟังนานขึ้นก่อนตัดประโยค เพื่อไม่ตัดคำเร็วเกินไป\nถ้า Auto ฟังผิด ให้เลือกภาษาผู้พูด 🇹🇭 / 🇨🇳 / 🇬🇧 ได้ทันที");
+        hint.setText("รอฟังเงียบประมาณ 3–4 วินาทีก่อนตัดประโยค\nพูดจบแล้วเว้นสั้น ๆ ระบบจะเริ่มฟังรอบถัดไปเอง");
         hint.setTextSize(13);
         hint.setTextColor(Color.GRAY);
         hint.setPadding(dp(4), dp(8), dp(4), dp(12));
@@ -287,6 +271,16 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.requestApplyInsets();
     }
 
+    private TextView smallTitle(String text) {
+        TextView v = new TextView(this);
+        v.setText(text);
+        v.setTypeface(Typeface.DEFAULT_BOLD);
+        v.setTextSize(13);
+        v.setTextColor(Color.rgb(75, 85, 100));
+        v.setPadding(0, dp(4), 0, 0);
+        return v;
+    }
+
     private CheckBox languageCheckBox(String text) {
         CheckBox c = new CheckBox(this);
         c.setText(text);
@@ -299,7 +293,7 @@ public class MainActivity extends Activity implements RecognitionListener {
     private RadioButton inputRadio(String text) {
         RadioButton r = new RadioButton(this);
         r.setText(text);
-        r.setTextSize(11);
+        r.setTextSize(12);
         r.setGravity(Gravity.CENTER_VERTICAL);
         return r;
     }
@@ -315,7 +309,9 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     private LinearLayout.LayoutParams full() {
         return new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
     }
 
     private LinearLayout.LayoutParams weighted() {
@@ -327,6 +323,11 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private boolean isUsable() {
+        return !destroyed && !isFinishing() &&
+                (Build.VERSION.SDK_INT < 17 || !isDestroyed());
     }
 
     private void restoreLanguageSelection() {
@@ -358,41 +359,24 @@ public class MainActivity extends Activity implements RecognitionListener {
         return count;
     }
 
-    private boolean isSelectedLanguage(String code) {
-        if ("th".equals(code)) return thaiCheck.isChecked();
-        if ("zh".equals(code)) return chineseCheck.isChecked();
-        if ("en".equals(code)) return englishCheck.isChecked();
-        return false;
-    }
-
-    private ArrayList<String> selectedLocales() {
-        ArrayList<String> locales = new ArrayList<>();
-        if (thaiCheck.isChecked()) locales.add("th-TH");
-        if (chineseCheck.isChecked()) locales.add("zh-CN");
-        if (englishCheck.isChecked()) locales.add("en-US");
-        return locales;
-    }
-
     private void updateLanguageHint() {
         ArrayList<String> names = new ArrayList<>();
         if (thaiCheck.isChecked()) names.add("ไทย");
         if (chineseCheck.isChecked()) names.add("中文(简体)");
         if (englishCheck.isChecked()) names.add("English");
-        languageHint.setText("ใช้งาน: " + android.text.TextUtils.join(" • ", names));
+        languageHint.setText("แสดงผล: " + android.text.TextUtils.join(" • ", names));
     }
 
     private void restoreInputLanguageMode() {
         String mode = getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getString("input_language_mode", "auto");
+                .getString("input_language_mode", "th");
 
-        if ("th".equals(mode)) {
-            thaiInput.setChecked(true);
-        } else if ("zh".equals(mode)) {
+        if ("zh".equals(mode) && chineseCheck.isChecked()) {
             chineseInput.setChecked(true);
-        } else if ("en".equals(mode)) {
+        } else if ("en".equals(mode) && englishCheck.isChecked()) {
             englishInput.setChecked(true);
         } else {
-            autoInput.setChecked(true);
+            thaiInput.setChecked(true);
         }
     }
 
@@ -404,10 +388,9 @@ public class MainActivity extends Activity implements RecognitionListener {
     }
 
     private String currentInputLanguage() {
-        if (thaiInput != null && thaiInput.isChecked()) return "th";
         if (chineseInput != null && chineseInput.isChecked()) return "zh";
         if (englishInput != null && englishInput.isChecked()) return "en";
-        return "auto";
+        return "th";
     }
 
     private String localeForCode(String code) {
@@ -419,35 +402,36 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void updateInputLanguageAvailability() {
         if (thaiInput == null) return;
 
-        // Input-language buttons stay active during a meeting so the user can
-        // switch immediately when the next speaker changes language.
         thaiInput.setEnabled(thaiCheck.isChecked());
         chineseInput.setEnabled(chineseCheck.isChecked());
         englishInput.setEnabled(englishCheck.isChecked());
-        autoInput.setEnabled(true);
 
         String mode = currentInputLanguage();
         if (("th".equals(mode) && !thaiCheck.isChecked()) ||
                 ("zh".equals(mode) && !chineseCheck.isChecked()) ||
                 ("en".equals(mode) && !englishCheck.isChecked())) {
-            autoInput.setChecked(true);
+            if (thaiCheck.isChecked()) thaiInput.setChecked(true);
+            else if (chineseCheck.isChecked()) chineseInput.setChecked(true);
+            else englishInput.setChecked(true);
         }
     }
 
     private void setStatus(String text) {
-        if (status != null) status.setText(text);
+        if (status != null && isUsable()) status.setText(text);
     }
 
     private void refreshButtons() {
+        if (!isUsable()) return;
+
         start.setEnabled(!running);
         pause.setEnabled(running);
         stop.setEnabled(running);
         pause.setText(paused ? "▶ ทำต่อ" : "⏸ พัก");
 
-        boolean canEditLanguages = !running;
-        thaiCheck.setEnabled(canEditLanguages);
-        chineseCheck.setEnabled(canEditLanguages);
-        englishCheck.setEnabled(canEditLanguages);
+        boolean canEditOutputs = !running;
+        thaiCheck.setEnabled(canEditOutputs);
+        chineseCheck.setEnabled(canEditOutputs);
+        englishCheck.setEnabled(canEditOutputs);
         updateInputLanguageAvailability();
     }
 
@@ -470,74 +454,83 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         running = true;
         paused = false;
+        changingLanguage = false;
+        recognitionActive = false;
+
         ensureRecognizer();
         refreshButtons();
-        beginRecognition();
+        scheduleStart(400L);
     }
 
     private void ensureRecognizer() {
-        if (recognizer == null) {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            recognizer.setRecognitionListener(this);
-        }
+        if (recognizer != null || !isUsable()) return;
+
+        recognizer = SpeechRecognizer.createSpeechRecognizer(getApplicationContext());
+        recognizer.setRecognitionListener(this);
     }
 
-    private void beginRecognition() {
-        if (!running || paused || recognizer == null || listening ||
-                isFinishing() || (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
-
-        handler.removeCallbacks(restartRunnable);
-        restartScheduled = false;
-        detectedLanguage = null;
-        partial.setText("");
-        setStatus("🟢 กำลังฟัง...");
+    private Intent buildRecognizerIntent() {
+        String locale = localeForCode(currentInputLanguage());
 
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
-        // Give speakers more time to pause naturally, especially for Chinese
-        // and longer English sentences.
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L);
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2600L);
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, locale);
+        i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false);
 
-        String inputMode = currentInputLanguage();
-        ArrayList<String> allowed = selectedLocales();
+        // Longer end-pointer windows: intended to reduce clipped sentences.
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 2000L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3800L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2600L);
+        return i;
+    }
 
-        if (!"auto".equals(inputMode)) {
-            // Explicit source mode is the reliable fallback on phones whose
-            // speech service cannot switch languages automatically.
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeForCode(inputMode));
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, localeForCode(inputMode));
-        } else if (Build.VERSION.SDK_INT >= 34) {
-            // Do not force Thai as the base language in Auto mode.
-            // Let the installed recognition provider choose among the allowed locales.
-            i.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true);
-            i.putStringArrayListExtra(
-                    RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
-                    allowed
-            );
+    private void beginRecognition() {
+        if (!isUsable() || !running || paused || recognitionActive) return;
 
-            if (allowed.size() > 1) {
-                i.putExtra(
-                        RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH,
-                        RecognizerIntent.LANGUAGE_SWITCH_QUICK_RESPONSE
-                );
-                i.putStringArrayListExtra(
-                        RecognizerIntent.EXTRA_LANGUAGE_SWITCH_ALLOWED_LANGUAGES,
-                        allowed
-                );
-            }
-        }
+        ensureRecognizer();
+        if (recognizer == null) return;
+
+        handler.removeCallbacks(restartRunnable);
+        partial.setText("");
+        setStatus("🟢 กำลังฟัง...");
 
         try {
-            listening = true;
-            recognizer.startListening(i);
+            recognitionActive = true;
+            recognizer.startListening(buildRecognizerIntent());
         } catch (Exception e) {
-            listening = false;
+            recognitionActive = false;
             setStatus("เริ่มฟังไม่สำเร็จ กำลังลองใหม่...");
-            restartRecognition(1400, false);
+            scheduleStart(RESTART_AFTER_ERROR_MS);
+        }
+    }
+
+    private void scheduleStart(long delayMs) {
+        if (!isUsable() || !running || paused) return;
+        handler.removeCallbacks(restartRunnable);
+        handler.postDelayed(restartRunnable, delayMs);
+    }
+
+    private void requestLanguageChange() {
+        if (!running || paused || recognizer == null) return;
+
+        changingLanguage = true;
+        handler.removeCallbacks(restartRunnable);
+        setStatus("กำลังเปลี่ยนภาษาผู้พูด...");
+
+        if (recognitionActive) {
+            try {
+                recognizer.cancel();
+            } catch (Exception e) {
+                recognitionActive = false;
+                changingLanguage = false;
+                scheduleStart(1200L);
+            }
+        } else {
+            changingLanguage = false;
+            scheduleStart(700L);
         }
     }
 
@@ -545,16 +538,16 @@ public class MainActivity extends Activity implements RecognitionListener {
         if (!running) return;
 
         paused = !paused;
+        handler.removeCallbacks(restartRunnable);
+
         if (paused) {
-            handler.removeCallbacks(restartRunnable);
-            restartScheduled = false;
-            listening = false;
-            if (recognizer != null) {
+            setStatus("⏸ พักการฟัง");
+            if (recognitionActive && recognizer != null) {
                 try { recognizer.cancel(); } catch (Exception ignored) {}
             }
-            setStatus("⏸ พักการฟัง");
         } else {
-            restartRecognition(500, false);
+            recognitionActive = false;
+            scheduleStart(700L);
         }
         refreshButtons();
     }
@@ -562,123 +555,112 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void stopSession() {
         running = false;
         paused = false;
-        listening = false;
+        changingLanguage = false;
         handler.removeCallbacks(restartRunnable);
-        restartScheduled = false;
-        if (recognizer != null) {
+
+        if (recognitionActive && recognizer != null) {
             try { recognizer.cancel(); } catch (Exception ignored) {}
         }
-        partial.setText("");
-        setStatus("หยุดแล้ว");
-        refreshButtons();
-    }
+        recognitionActive = false;
 
-    private void restartRecognition(long delay, boolean cancelCurrent) {
-        if (!running || paused) return;
-
-        handler.removeCallbacks(restartRunnable);
-        restartScheduled = true;
-
-        if (cancelCurrent && recognizer != null) {
-            listening = false;
-            try { recognizer.cancel(); } catch (Exception ignored) {}
+        if (isUsable()) {
+            partial.setText("");
+            setStatus("หยุดแล้ว");
+            refreshButtons();
         }
-
-        handler.postDelayed(restartRunnable, delay);
     }
 
-    private void recreateRecognizer() {
-        listening = false;
-        if (recognizer != null) {
-            try { recognizer.cancel(); } catch (Exception ignored) {}
-            try { recognizer.destroy(); } catch (Exception ignored) {}
-        }
-        recognizer = null;
-
-        if (!running || paused || isFinishing() ||
-                (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
-
-        handler.postDelayed(() -> {
-            if (!running || paused || isFinishing() ||
-                    (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
-            ensureRecognizer();
-            restartRecognition(700, false);
-        }, 450);
-    }
-
-    @Override public void onReadyForSpeech(Bundle params) {
-        listening = true;
-        busyErrorCount = 0;
+    @Override
+    public void onReadyForSpeech(Bundle params) {
         setStatus("🟢 กำลังฟัง...");
     }
-    @Override public void onBeginningOfSpeech() { setStatus("🎙 กำลังพูด..."); }
+
+    @Override
+    public void onBeginningOfSpeech() {
+        setStatus("🎙 กำลังพูด...");
+    }
+
     @Override public void onRmsChanged(float rmsdB) {}
     @Override public void onBufferReceived(byte[] buffer) {}
-    @Override public void onEndOfSpeech() {
-        listening = false;
+
+    @Override
+    public void onEndOfSpeech() {
         setStatus("กำลังประมวลผล...");
+        // IMPORTANT: do not call startListening here.
+        // Wait for onResults/onError from this recognition cycle.
     }
 
     @Override
     public void onError(int error) {
-        listening = false;
-        if (!running || paused) return;
+        recognitionActive = false;
 
-        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
-            busyErrorCount++;
-            setStatus("ไมค์กำลังรีเซ็ต...");
-            if (busyErrorCount >= 2) {
-                busyErrorCount = 0;
-                recreateRecognizer();
-            } else {
-                restartRecognition(1600, true);
-            }
+        if (!isUsable() || !running || paused) return;
+
+        if (changingLanguage) {
+            changingLanguage = false;
+            scheduleStart(900L);
             return;
         }
 
         if (error == SpeechRecognizer.ERROR_NO_MATCH ||
                 error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
             setStatus("🟢 รอฟังประโยคถัดไป...");
-            restartRecognition(900, false);
+            scheduleStart(RESTART_AFTER_TIMEOUT_MS);
             return;
         }
 
-        setStatus("กำลังเริ่มฟังใหม่...");
-        restartRecognition(1300, true);
+        if (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED) {
+            setStatus("ภาษานี้ไม่รองรับโดยบริการเสียงของเครื่อง");
+            running = false;
+            refreshButtons();
+            return;
+        }
+
+        if (error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
+            setStatus("ภาษานี้ยังไม่พร้อมใช้งาน กรุณาลองเชื่อมอินเทอร์เน็ต");
+            running = false;
+            refreshButtons();
+            return;
+        }
+
+        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+            setStatus("ไมค์ยังไม่พร้อม กำลังรอ...");
+            scheduleStart(2600L);
+            return;
+        }
+
+        setStatus("การฟังสะดุด กำลังเริ่มใหม่...");
+        scheduleStart(RESTART_AFTER_ERROR_MS);
     }
 
     @Override
     public void onResults(Bundle results) {
+        recognitionActive = false;
+
+        if (!isUsable()) return;
+
         String text = firstText(results);
         partial.setText("");
 
         if (text != null && !text.trim().isEmpty()) {
-            String inputMode = currentInputLanguage();
-            String sourceHint = "auto".equals(inputMode) ? detectedLanguage : inputMode;
-            processUtterance(text.trim(), sourceHint);
+            String source = currentInputLanguage();
+            processUtterance(text.trim(), source);
         }
 
-        listening = false;
-        if (running && !paused) restartRecognition(850, false);
+        if (running && !paused) {
+            scheduleStart(RESTART_AFTER_RESULT_MS);
+        }
     }
 
     @Override
     public void onPartialResults(Bundle partialResults) {
+        if (!isUsable()) return;
+
         String text = firstText(partialResults);
-        if (text != null && !isFinishing()) partial.setText("“" + text + "”");
+        if (text != null) partial.setText("“" + text + "”");
     }
 
     @Override public void onEvent(int eventType, Bundle params) {}
-
-    @Override
-    public void onLanguageDetection(Bundle results) {
-        if (Build.VERSION.SDK_INT >= 34 && results != null &&
-                "auto".equals(currentInputLanguage())) {
-            String tag = results.getString(SpeechRecognizer.DETECTED_LANGUAGE);
-            String normalized = normalize(tag);
-            if (isSelectedLanguage(normalized)) detectedLanguage = normalized;
-        }
-    }
 
     private String firstText(Bundle b) {
         if (b == null) return null;
@@ -686,34 +668,12 @@ public class MainActivity extends Activity implements RecognitionListener {
         return (list == null || list.isEmpty()) ? null : list.get(0);
     }
 
-    private void processUtterance(String original, String sourceHint) {
+    private void processUtterance(String original, String source) {
+        if (!isUsable()) return;
+
         Card card = addCard(original);
-        setStatus("กำลังตรวจภาษาและแปล...");
-
-        if (supported(sourceHint) && isSelectedLanguage(sourceHint)) {
-            translateSelected(original, sourceHint, card);
-            return;
-        }
-
-        languageIdentifier.identifyLanguage(original)
-                .addOnSuccessListener(code -> {
-                    String source = normalize(code);
-                    if (!supported(source)) {
-                        card.setError("ตรวจจับภาษาไม่ได้");
-                        resumeListeningStatus();
-                        return;
-                    }
-                    if (!isSelectedLanguage(source)) {
-                        card.setError("ภาษานี้ไม่ได้ถูกเลือก");
-                        resumeListeningStatus();
-                        return;
-                    }
-                    translateSelected(original, source, card);
-                })
-                .addOnFailureListener(e -> {
-                    card.setError("ตรวจจับภาษาไม่สำเร็จ");
-                    resumeListeningStatus();
-                });
+        setStatus("กำลังแปล...");
+        translateSelected(original, source, card);
     }
 
     private void translateSelected(String text, String source, Card card) {
@@ -743,13 +703,13 @@ public class MainActivity extends Activity implements RecognitionListener {
     }
 
     private synchronized void finishTranslation(int done, int expected) {
-        if (done >= expected) resumeListeningStatus();
-    }
-
-    private void resumeListeningStatus() {
-        runOnUiThread(() -> {
-            if (running && !paused) setStatus("🟢 กำลังฟัง...");
-        });
+        if (done >= expected && isUsable()) {
+            runOnUiThread(() -> {
+                if (isUsable() && running && !paused && !recognitionActive) {
+                    setStatus("🟢 รอฟังประโยคถัดไป...");
+                }
+            });
+        }
     }
 
     private interface TextCallback {
@@ -766,10 +726,19 @@ public class MainActivity extends Activity implements RecognitionListener {
         DownloadConditions conditions = new DownloadConditions.Builder().build();
 
         translator.downloadModelIfNeeded(conditions)
-                .addOnSuccessListener(v -> translator.translate(text)
-                        .addOnSuccessListener(cb::onDone)
-                        .addOnFailureListener(e -> cb.onDone("[แปลไม่สำเร็จ]")))
-                .addOnFailureListener(e -> cb.onDone("[ดาวน์โหลดโมเดลไม่สำเร็จ]"));
+                .addOnSuccessListener(v -> {
+                    if (destroyed) return;
+                    translator.translate(text)
+                            .addOnSuccessListener(value -> {
+                                if (!destroyed) cb.onDone(value);
+                            })
+                            .addOnFailureListener(e -> {
+                                if (!destroyed) cb.onDone("[แปลไม่สำเร็จ]");
+                            });
+                })
+                .addOnFailureListener(e -> {
+                    if (!destroyed) cb.onDone("[ดาวน์โหลดโมเดลไม่สำเร็จ]");
+                });
     }
 
     private Translator translator(String source, String target) {
@@ -788,33 +757,16 @@ public class MainActivity extends Activity implements RecognitionListener {
     }
 
     private String ml(String code) {
-        switch (code) {
-            case "th":
-                return TranslateLanguage.THAI;
-            case "zh":
-                // Chinese in this app is paired with zh-CN speech recognition
-                // and presented as Simplified Chinese.
-                return TranslateLanguage.CHINESE;
-            default:
-                return TranslateLanguage.ENGLISH;
-        }
-    }
-
-    private String normalize(String tag) {
-        if (tag == null) return null;
-
-        String s = tag.toLowerCase(Locale.ROOT);
-        if (s.startsWith("th")) return "th";
-        if (s.startsWith("zh") || s.startsWith("cmn")) return "zh";
-        if (s.startsWith("en")) return "en";
-        return null;
-    }
-
-    private boolean supported(String s) {
-        return "th".equals(s) || "zh".equals(s) || "en".equals(s);
+        if ("th".equals(code)) return TranslateLanguage.THAI;
+        if ("zh".equals(code)) return TranslateLanguage.CHINESE;
+        return TranslateLanguage.ENGLISH;
     }
 
     private Card addCard(String original) {
+        if (timeline.getChildCount() >= 30) {
+            timeline.removeViewAt(0);
+        }
+
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(14), dp(12), dp(14), dp(12));
@@ -846,7 +798,10 @@ public class MainActivity extends Activity implements RecognitionListener {
         if (chineseCheck.isChecked()) box.addView(zh, full());
         if (englishCheck.isChecked()) box.addView(en, full());
 
-        handler.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+        handler.post(() -> {
+            if (isUsable()) scroll.fullScroll(View.FOCUS_DOWN);
+        });
+
         return new Card(th, zh, en);
     }
 
@@ -872,6 +827,8 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         void setLine(String code, String value) {
             runOnUiThread(() -> {
+                if (!isUsable()) return;
+
                 if ("th".equals(code) && thaiCheck.isChecked()) {
                     th.setText("🇹🇭 " + value);
                 } else if ("zh".equals(code) && chineseCheck.isChecked()) {
@@ -879,24 +836,37 @@ public class MainActivity extends Activity implements RecognitionListener {
                 } else if ("en".equals(code) && englishCheck.isChecked()) {
                     en.setText("🇬🇧 " + value);
                 }
-                handler.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
-            });
-        }
 
-        void setError(String message) {
-            runOnUiThread(() -> {
-                if (thaiCheck.isChecked()) th.setText("⚠️ " + message);
-                if (chineseCheck.isChecked()) zh.setText("");
-                if (englishCheck.isChecked()) en.setText("");
+                handler.post(() -> {
+                    if (isUsable()) scroll.fullScroll(View.FOCUS_DOWN);
+                });
             });
         }
     }
 
-    private String safe(Exception e) {
-        String m = e.getMessage();
-        return (m == null || m.trim().isEmpty())
-                ? e.getClass().getSimpleName()
-                : m;
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (running && !isChangingConfigurations()) {
+            running = false;
+            paused = false;
+            changingLanguage = false;
+            handler.removeCallbacks(restartRunnable);
+
+            if (recognitionActive && recognizer != null) {
+                try { recognizer.cancel(); } catch (Exception ignored) {}
+            }
+            recognitionActive = false;
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (!destroyed && status != null && !running) {
+            setStatus("พร้อม");
+            refreshButtons();
+        }
     }
 
     @Override
@@ -914,10 +884,11 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
         running = false;
         paused = true;
-        listening = false;
-        restartScheduled = false;
+        recognitionActive = false;
+        changingLanguage = false;
         handler.removeCallbacksAndMessages(null);
 
         if (recognizer != null) {
@@ -926,10 +897,10 @@ public class MainActivity extends Activity implements RecognitionListener {
             recognizer = null;
         }
 
-        for (Translator t : translators.values()) t.close();
+        for (Translator t : translators.values()) {
+            try { t.close(); } catch (Exception ignored) {}
+        }
         translators.clear();
-
-        if (languageIdentifier != null) languageIdentifier.close();
 
         super.onDestroy();
     }
