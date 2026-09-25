@@ -48,14 +48,14 @@ public class MainActivity extends Activity implements RecognitionListener {
     private static final String PREFS = "trilingo_preferences";
 
     // Faster restart between standard recognition cycles.
-    private static final long RESTART_AFTER_RESULT_MS = 450L;
-    private static final long RESTART_AFTER_TIMEOUT_MS = 650L;
+    private static final long RESTART_AFTER_RESULT_MS = 350L;
+    private static final long RESTART_AFTER_TIMEOUT_MS = 500L;
     private static final long RESTART_AFTER_ERROR_MS = 1500L;
 
     // A short pause becomes a new segment/sentence.
-    private static final long SEGMENT_SILENCE_MS = 1400L;
-    private static final long POSSIBLE_SEGMENT_SILENCE_MS = 900L;
-    private static final long MINIMUM_SEGMENT_MS = 650L;
+    private static final long SEGMENT_SILENCE_MS = 1500L;
+    private static final long POSSIBLE_SEGMENT_SILENCE_MS = 950L;
+    private static final long MINIMUM_SEGMENT_MS = 500L;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Translator> translators = new HashMap<>();
@@ -69,7 +69,6 @@ public class MainActivity extends Activity implements RecognitionListener {
     private boolean recognitionActive = false;
     private boolean changingContext = false;
     private boolean destroyed = false;
-    private boolean segmentResultReceived = false;
 
     private TextView status;
     private TextView partial;
@@ -241,8 +240,8 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         TextView hint = new TextView(this);
         hint.setText(
-                "พูดต่อเนื่องหลายประโยคได้ • เว้นช่วงสั้น ๆ ระหว่างประโยค\n" +
-                "ระบบจะแยกเป็นรายการใหม่และฟังต่ออัตโนมัติ"
+                "เว้นเงียบประมาณ 1–2 วินาทีหลังแต่ละประโยค\n" +
+                "ระบบจะสร้างรายการ แปลทันที แล้วเริ่มฟังประโยคถัดไป"
         );
         hint.setTextSize(12);
         hint.setTextColor(Color.GRAY);
@@ -905,16 +904,6 @@ public class MainActivity extends Activity implements RecognitionListener {
                 POSSIBLE_SEGMENT_SILENCE_MS
         );
 
-        // Android 13+ can return many segments from a single listening session.
-        // If the installed recognizer ignores this, the normal onResults fallback
-        // below still restarts quickly after every utterance.
-        if (Build.VERSION.SDK_INT >= 33) {
-            i.putExtra(
-                    RecognizerIntent.EXTRA_SEGMENTED_SESSION,
-                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS
-            );
-        }
-
         return i;
     }
 
@@ -932,7 +921,6 @@ public class MainActivity extends Activity implements RecognitionListener {
         handler.removeCallbacks(restartRunnable);
 
         partial.setText("");
-        segmentResultReceived = false;
         speakerForCurrentRecognition = currentSpeakerId;
         sourceForCurrentRecognition = currentInputLanguage();
 
@@ -1058,49 +1046,17 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     @Override
     public void onEndOfSpeech() {
-        setStatus("กำลังประมวลผล...");
+        setStatus("กำลังปิดประโยคและแปล...");
     }
 
     @Override
     public void onSegmentResults(Bundle segmentResults) {
-        if (Build.VERSION.SDK_INT < 33 || !isUsable()) return;
-
-        segmentResultReceived = true;
-        String text = firstText(segmentResults);
-
-        if (text != null && !text.trim().isEmpty()) {
-            partial.setText("");
-            acceptRecognizedText(
-                    text.trim(),
-                    sourceForCurrentRecognition,
-                    speakerForCurrentRecognition
-            );
-        }
-
-        if (running && !paused) {
-            setStatus(
-                    "🟢 " +
-                    speakerName(speakerForCurrentRecognition) +
-                    " ฟังต่อ..."
-            );
-        }
+        // v1.5 intentionally does not use segmented sessions.
     }
 
     @Override
     public void onEndOfSegmentedSession() {
-        if (Build.VERSION.SDK_INT < 33) return;
-
-        recognitionActive = false;
-        partial.setText("");
-
-        if (!isUsable() || !running || paused) return;
-
-        if (changingContext) {
-            changingContext = false;
-            scheduleStart(350L);
-        } else {
-            scheduleStart(300L);
-        }
+        // v1.5 intentionally does not use segmented sessions.
     }
 
     @Override
@@ -1152,24 +1108,19 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         if (!isUsable()) return;
 
-        // Some recognizers send onResults after segmented callbacks.
-        // Avoid creating the same long transcript twice.
-        if (!segmentResultReceived) {
-            String text = firstText(results);
-            partial.setText("");
+        String text = firstText(results);
+        partial.setText("");
 
-            if (text != null && !text.trim().isEmpty()) {
-                acceptRecognizedText(
-                        text.trim(),
-                        sourceForCurrentRecognition,
-                        speakerForCurrentRecognition
-                );
-            }
-        } else {
-            partial.setText("");
+        if (text != null && !text.trim().isEmpty()) {
+            acceptRecognizedText(
+                    text.trim(),
+                    sourceForCurrentRecognition,
+                    speakerForCurrentRecognition
+            );
         }
 
         if (running && !paused) {
+            setStatus("🟢 แปลแล้วกำลังเริ่มฟังประโยคถัดไป...");
             scheduleStart(RESTART_AFTER_RESULT_MS);
         }
     }
@@ -1231,9 +1182,8 @@ public class MainActivity extends Activity implements RecognitionListener {
     private ArrayList<String> splitIntoSentenceUnits(String text) {
         ArrayList<String> units = new ArrayList<>();
 
-        // Preserve punctuation at the end of each unit. This helps Chinese and
-        // English when the recognition provider returns several sentences
-        // together. Thai still benefits from segmented-session pauses.
+        // Preserve punctuation at the end of each unit in case the speech
+        // provider still returns more than one sentence in a standard result.
         String[] pieces = text.split(
                 "(?<=[.!?。！？；;])\\s*|\\n+"
         );
