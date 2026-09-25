@@ -409,10 +409,12 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void updateInputLanguageAvailability() {
         if (thaiInput == null) return;
 
-        thaiInput.setEnabled(thaiCheck.isChecked() && !running);
-        chineseInput.setEnabled(chineseCheck.isChecked() && !running);
-        englishInput.setEnabled(englishCheck.isChecked() && !running);
-        autoInput.setEnabled(!running);
+        // Input-language buttons stay active during a meeting so the user can
+        // switch immediately when the next speaker changes language.
+        thaiInput.setEnabled(thaiCheck.isChecked());
+        chineseInput.setEnabled(chineseCheck.isChecked());
+        englishInput.setEnabled(englishCheck.isChecked());
+        autoInput.setEnabled(true);
 
         String mode = currentInputLanguage();
         if (("th".equals(mode) && !thaiCheck.isChecked()) ||
