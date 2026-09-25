@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
@@ -16,6 +17,7 @@ import android.speech.SpeechRecognizer;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -70,8 +72,41 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(14));
         root.setBackgroundColor(Color.rgb(247, 249, 252));
+
+        final int baseLeft = dp(18);
+        final int baseTop = dp(8);
+        final int baseRight = dp(18);
+        final int baseBottom = dp(12);
+
+        root.setPadding(baseLeft, baseTop, baseRight, baseBottom);
+        root.setOnApplyWindowInsetsListener((view, windowInsets) -> {
+            int topInset;
+            int bottomInset;
+            int leftInset;
+            int rightInset;
+
+            if (Build.VERSION.SDK_INT >= 30) {
+                Insets bars = windowInsets.getInsets(WindowInsets.Type.systemBars());
+                topInset = bars.top;
+                bottomInset = bars.bottom;
+                leftInset = bars.left;
+                rightInset = bars.right;
+            } else {
+                topInset = windowInsets.getSystemWindowInsetTop();
+                bottomInset = windowInsets.getSystemWindowInsetBottom();
+                leftInset = windowInsets.getSystemWindowInsetLeft();
+                rightInset = windowInsets.getSystemWindowInsetRight();
+            }
+
+            view.setPadding(
+                    baseLeft + leftInset,
+                    baseTop + topInset + dp(4),
+                    baseRight + rightInset,
+                    baseBottom + bottomInset + dp(12)
+            );
+            return windowInsets;
+        });
 
         TextView title = new TextView(this);
         title.setText("TriLingo Meeting");
@@ -112,7 +147,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         hint.setText("กดเริ่มครั้งเดียว แล้วพูดภาษาไทย จีน หรืออังกฤษได้เลย\nครั้งแรกอาจใช้เวลาสักครู่เพื่อดาวน์โหลดโมเดลแปลภาษา");
         hint.setTextSize(13);
         hint.setTextColor(Color.GRAY);
-        hint.setPadding(dp(4), dp(8), dp(4), dp(8));
+        hint.setPadding(dp(4), dp(8), dp(4), dp(14));
         root.addView(hint, full());
 
         LinearLayout controls = new LinearLayout(this);
@@ -130,9 +165,13 @@ public class MainActivity extends Activity implements RecognitionListener {
         controls.addView(start, weighted());
         controls.addView(pause, weighted());
         controls.addView(stop, weighted());
-        root.addView(controls, full());
+
+        LinearLayout.LayoutParams controlParams = full();
+        controlParams.setMargins(0, dp(4), 0, dp(4));
+        root.addView(controls, controlParams);
 
         setContentView(root);
+        root.requestApplyInsets();
     }
 
     private Button makeButton(String text) {
@@ -425,7 +464,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         timeline.addView(box, bp);
 
         TextView header = new TextView(this);
-        header.setText("Speaker • " + label(source) + " • " + clock.format(new Date()));
+        header.setText("Speaker • " + clock.format(new Date()));
         header.setTypeface(Typeface.DEFAULT_BOLD);
         header.setTextColor(Color.rgb(80, 90, 105));
         box.addView(header, full());
@@ -438,9 +477,9 @@ public class MainActivity extends Activity implements RecognitionListener {
         originalView.setPadding(0, dp(8), 0, dp(8));
         box.addView(originalView, full());
 
-        TextView th = line("🇹🇭 ไทย\nกำลังแปล...");
-        TextView zh = line("🇨🇳 中文\nกำลังแปล...");
-        TextView en = line("🇬🇧 English\nTranslating...");
+        TextView th = line("🇹🇭 กำลังแปล...");
+        TextView zh = line("🇨🇳 กำลังแปล...");
+        TextView en = line("🇬🇧 Translating...");
         box.addView(th, full());
         box.addView(zh, full());
         box.addView(en, full());
@@ -465,12 +504,12 @@ public class MainActivity extends Activity implements RecognitionListener {
         }
         void setLanguage(String code) {
             runOnUiThread(() ->
-                    header.setText("Speaker • " + label(code) + " • " + clock.format(new Date())));
+                    header.setText("Speaker • " + clock.format(new Date())));
         }
         void setTranslations(String thai, String chinese, String english) {
-            th.setText("🇹🇭 ไทย\n" + thai);
-            zh.setText("🇨🇳 中文\n" + chinese);
-            en.setText("🇬🇧 English\n" + english);
+            th.setText("🇹🇭 " + thai);
+            zh.setText("🇨🇳 " + chinese);
+            en.setText("🇬🇧 " + english);
             handler.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
         }
         void setError(String message) {
