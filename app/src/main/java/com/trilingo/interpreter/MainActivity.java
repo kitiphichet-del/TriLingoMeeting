@@ -22,6 +22,8 @@ import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -54,7 +56,6 @@ public class MainActivity extends Activity implements RecognitionListener {
     private boolean running = false;
     private boolean paused = false;
     private String detectedLanguage = null;
-    private boolean speechModelsRequested = false;
 
     private TextView status;
     private TextView partial;
@@ -67,6 +68,11 @@ public class MainActivity extends Activity implements RecognitionListener {
     private CheckBox thaiCheck;
     private CheckBox chineseCheck;
     private CheckBox englishCheck;
+    private RadioGroup inputLanguageGroup;
+    private RadioButton autoInput;
+    private RadioButton thaiInput;
+    private RadioButton chineseInput;
+    private RadioButton englishInput;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -74,6 +80,8 @@ public class MainActivity extends Activity implements RecognitionListener {
         languageIdentifier = LanguageIdentification.getClient();
         buildUi();
         restoreLanguageSelection();
+        restoreInputLanguageMode();
+        updateInputLanguageAvailability();
         updateLanguageHint();
         setStatus("พร้อม");
         refreshButtons();
@@ -133,7 +141,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(subtitle, full());
 
         TextView selectorTitle = new TextView(this);
-        selectorTitle.setText("เลือกภาษาที่ต้องการฟังและแปล");
+        selectorTitle.setText("เลือกภาษาที่ใช้ในการสนทนา");
         selectorTitle.setTypeface(Typeface.DEFAULT_BOLD);
         selectorTitle.setTextSize(13);
         selectorTitle.setTextColor(Color.rgb(75, 85, 100));
@@ -161,8 +169,7 @@ public class MainActivity extends Activity implements RecognitionListener {
                 return;
             }
             saveLanguageSelection();
-            speechModelsRequested = false;
-            if (recognizer != null) requestSpeechModels();
+            updateInputLanguageAvailability();
             updateLanguageHint();
         };
         thaiCheck.setOnClickListener(languageClick);
@@ -174,6 +181,49 @@ public class MainActivity extends Activity implements RecognitionListener {
         languageHint.setTextColor(Color.GRAY);
         languageHint.setPadding(dp(2), 0, dp(2), dp(4));
         root.addView(languageHint, full());
+
+        TextView inputTitle = new TextView(this);
+        inputTitle.setText("ภาษาผู้พูดตอนนี้");
+        inputTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        inputTitle.setTextSize(13);
+        inputTitle.setTextColor(Color.rgb(75, 85, 100));
+        inputTitle.setPadding(0, dp(3), 0, dp(1));
+        root.addView(inputTitle, full());
+
+        inputLanguageGroup = new RadioGroup(this);
+        inputLanguageGroup.setOrientation(LinearLayout.HORIZONTAL);
+        inputLanguageGroup.setGravity(Gravity.CENTER_VERTICAL);
+
+        autoInput = inputRadio("Auto");
+        thaiInput = inputRadio("🇹🇭 ไทย");
+        chineseInput = inputRadio("🇨🇳 中文");
+        englishInput = inputRadio("🇬🇧 EN");
+
+        autoInput.setId(View.generateViewId());
+        thaiInput.setId(View.generateViewId());
+        chineseInput.setId(View.generateViewId());
+        englishInput.setId(View.generateViewId());
+
+        inputLanguageGroup.addView(autoInput, weighted());
+        inputLanguageGroup.addView(thaiInput, weighted());
+        inputLanguageGroup.addView(chineseInput, weighted());
+        inputLanguageGroup.addView(englishInput, weighted());
+        root.addView(inputLanguageGroup, full());
+
+        TextView inputHelp = new TextView(this);
+        inputHelp.setText("ถ้า Auto ฟังจีน/อังกฤษผิด ให้แตะภาษาผู้พูดก่อนเริ่มพูด");
+        inputHelp.setTextSize(11);
+        inputHelp.setTextColor(Color.GRAY);
+        inputHelp.setPadding(dp(2), 0, dp(2), dp(3));
+        root.addView(inputHelp, full());
+
+        inputLanguageGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            saveInputLanguageMode();
+            if (running && !paused) {
+                if (recognizer != null) recognizer.cancel();
+                handler.postDelayed(this::beginRecognition, 180);
+            }
+        });
 
         status = new TextView(this);
         status.setTextSize(15);
@@ -197,7 +247,7 @@ public class MainActivity extends Activity implements RecognitionListener {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         TextView hint = new TextView(this);
-        hint.setText("กดเริ่มครั้งเดียว แล้วสนทนาด้วยภาษาที่เลือกได้เลย\nระบบจะตรวจภาษาและแปลไปยังภาษาที่เลือกโดยอัตโนมัติ");
+        hint.setText("พูดจีนแล้วเป็นไทย ให้เลือก 🇨🇳 中文 ที่ ‘ภาษาผู้พูดตอนนี้’\nAuto ใช้ได้เมื่อบริการ Speech ของเครื่องรองรับการสลับภาษา");
         hint.setTextSize(13);
         hint.setTextColor(Color.GRAY);
         hint.setPadding(dp(4), dp(8), dp(4), dp(12));
@@ -234,6 +284,14 @@ public class MainActivity extends Activity implements RecognitionListener {
         c.setGravity(Gravity.CENTER_VERTICAL);
         c.setButtonTintList(null);
         return c;
+    }
+
+    private RadioButton inputRadio(String text) {
+        RadioButton r = new RadioButton(this);
+        r.setText(text);
+        r.setTextSize(11);
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        return r;
     }
 
     private Button makeButton(String text) {
@@ -305,18 +363,63 @@ public class MainActivity extends Activity implements RecognitionListener {
         return locales;
     }
 
-    private String firstSelectedLocale() {
-        if (thaiCheck.isChecked()) return "th-TH";
-        if (chineseCheck.isChecked()) return "zh-CN";
-        return "en-US";
-    }
-
     private void updateLanguageHint() {
         ArrayList<String> names = new ArrayList<>();
         if (thaiCheck.isChecked()) names.add("ไทย");
         if (chineseCheck.isChecked()) names.add("中文(简体)");
         if (englishCheck.isChecked()) names.add("English");
         languageHint.setText("ใช้งาน: " + android.text.TextUtils.join(" • ", names));
+    }
+
+    private void restoreInputLanguageMode() {
+        String mode = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString("input_language_mode", "auto");
+
+        if ("th".equals(mode)) {
+            thaiInput.setChecked(true);
+        } else if ("zh".equals(mode)) {
+            chineseInput.setChecked(true);
+        } else if ("en".equals(mode)) {
+            englishInput.setChecked(true);
+        } else {
+            autoInput.setChecked(true);
+        }
+    }
+
+    private void saveInputLanguageMode() {
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString("input_language_mode", currentInputLanguage())
+                .apply();
+    }
+
+    private String currentInputLanguage() {
+        if (thaiInput != null && thaiInput.isChecked()) return "th";
+        if (chineseInput != null && chineseInput.isChecked()) return "zh";
+        if (englishInput != null && englishInput.isChecked()) return "en";
+        return "auto";
+    }
+
+    private String localeForCode(String code) {
+        if ("zh".equals(code)) return "zh-CN";
+        if ("en".equals(code)) return "en-US";
+        return "th-TH";
+    }
+
+    private void updateInputLanguageAvailability() {
+        if (thaiInput == null) return;
+
+        thaiInput.setEnabled(thaiCheck.isChecked() && !running);
+        chineseInput.setEnabled(chineseCheck.isChecked() && !running);
+        englishInput.setEnabled(englishCheck.isChecked() && !running);
+        autoInput.setEnabled(!running);
+
+        String mode = currentInputLanguage();
+        if (("th".equals(mode) && !thaiCheck.isChecked()) ||
+                ("zh".equals(mode) && !chineseCheck.isChecked()) ||
+                ("en".equals(mode) && !englishCheck.isChecked())) {
+            autoInput.setChecked(true);
+        }
     }
 
     private void setStatus(String text) {
@@ -333,6 +436,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         thaiCheck.setEnabled(canEditLanguages);
         chineseCheck.setEnabled(canEditLanguages);
         englishCheck.setEnabled(canEditLanguages);
+        updateInputLanguageAvailability();
     }
 
     private void startSession() {
@@ -363,7 +467,6 @@ public class MainActivity extends Activity implements RecognitionListener {
         if (recognizer == null) {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
             recognizer.setRecognitionListener(this);
-            requestSpeechModels();
         }
     }
 
@@ -378,13 +481,20 @@ public class MainActivity extends Activity implements RecognitionListener {
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
-        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, firstSelectedLocale());
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L);
         i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
 
-        if (Build.VERSION.SDK_INT >= 34) {
-            ArrayList<String> allowed = selectedLocales();
+        String inputMode = currentInputLanguage();
+        ArrayList<String> allowed = selectedLocales();
 
+        if (!"auto".equals(inputMode)) {
+            // Explicit source mode is the reliable fallback on phones whose
+            // speech service cannot switch languages automatically.
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeForCode(inputMode));
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, localeForCode(inputMode));
+        } else if (Build.VERSION.SDK_INT >= 34) {
+            // Do not force Thai as the base language in Auto mode.
+            // Let the installed recognition provider choose among the allowed locales.
             i.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true);
             i.putStringArrayListExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
@@ -408,25 +518,6 @@ public class MainActivity extends Activity implements RecognitionListener {
         } catch (Exception e) {
             setStatus("เริ่มฟังไม่สำเร็จ: " + safe(e));
             scheduleRestart(1200);
-        }
-    }
-
-    private void requestSpeechModels() {
-        if (speechModelsRequested || recognizer == null || Build.VERSION.SDK_INT < 33) return;
-        speechModelsRequested = true;
-
-        for (String locale : selectedLocales()) {
-            Intent modelIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-            modelIntent.putExtra(
-                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-            );
-            modelIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale);
-            try {
-                recognizer.triggerModelDownload(modelIntent);
-            } catch (Exception ignored) {
-                // Recognition providers may handle models online instead.
-            }
         }
     }
 
@@ -480,7 +571,9 @@ public class MainActivity extends Activity implements RecognitionListener {
         partial.setText("");
 
         if (text != null && !text.trim().isEmpty()) {
-            processUtterance(text.trim(), detectedLanguage);
+            String inputMode = currentInputLanguage();
+            String sourceHint = "auto".equals(inputMode) ? detectedLanguage : inputMode;
+            processUtterance(text.trim(), sourceHint);
         }
 
         if (running && !paused) scheduleRestart(250);
@@ -496,7 +589,8 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     @Override
     public void onLanguageDetection(Bundle results) {
-        if (Build.VERSION.SDK_INT >= 34 && results != null) {
+        if (Build.VERSION.SDK_INT >= 34 && results != null &&
+                "auto".equals(currentInputLanguage())) {
             String tag = results.getString(SpeechRecognizer.DETECTED_LANGUAGE);
             String normalized = normalize(tag);
             if (isSelectedLanguage(normalized)) detectedLanguage = normalized;
